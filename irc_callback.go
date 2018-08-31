@@ -1,10 +1,9 @@
 package irc
 
 import (
-	"crypto/sha1"
-	"fmt"
-	"math/rand"
+	"context"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -12,36 +11,45 @@ import (
 
 // Register a callback to a connection and event code. A callback is a function
 // which takes only an Event pointer as parameter. Valid event codes are all
-// IRC/CTCP commands and error/response codes. This function returns the ID of
-// the registered callback for later management.
-func (irc *Connection) AddCallback(eventcode string, callback func(*Event)) string {
+// IRC/CTCP commands and error/response codes. To register a callback for all
+// events pass "*" as the event code. This function returns the ID of the
+// registered callback for later management.
+func (irc *Connection) AddCallback(eventcode string, callback func(*Event)) int {
 	eventcode = strings.ToUpper(eventcode)
+	id := 0
 
-	if _, ok := irc.events[eventcode]; !ok {
-		irc.events[eventcode] = make(map[string]func(*Event))
+	irc.eventsMutex.Lock()
+	_, ok := irc.events[eventcode]
+	if !ok {
+		irc.events[eventcode] = make(map[int]func(*Event))
+		id = 0
+	} else {
+		id = len(irc.events[eventcode])
 	}
-	h := sha1.New()
-	rawId := []byte(fmt.Sprintf("%v%d", reflect.ValueOf(callback).Pointer(), rand.Int63()))
-	h.Write(rawId)
-	id := fmt.Sprintf("%x", h.Sum(nil))
 	irc.events[eventcode][id] = callback
+	irc.eventsMutex.Unlock()
 	return id
 }
 
 // Remove callback i (ID) from the given event code. This functions returns
 // true upon success, false if any error occurs.
-func (irc *Connection) RemoveCallback(eventcode string, i string) bool {
+func (irc *Connection) RemoveCallback(eventcode string, i int) bool {
 	eventcode = strings.ToUpper(eventcode)
 
-	if event, ok := irc.events[eventcode]; ok {
+	irc.eventsMutex.Lock()
+	event, ok := irc.events[eventcode]
+	if ok {
 		if _, ok := event[i]; ok {
 			delete(irc.events[eventcode], i)
+			irc.eventsMutex.Unlock()
 			return true
 		}
-		irc.Log.Printf("Event found, but no callback found at id %s\n", i)
+		irc.Log.Printf("Event found, but no callback found at id %d\n", i)
+		irc.eventsMutex.Unlock()
 		return false
 	}
 
+	irc.eventsMutex.Unlock()
 	irc.Log.Println("Event not found")
 	return false
 }
@@ -51,25 +59,32 @@ func (irc *Connection) RemoveCallback(eventcode string, i string) bool {
 func (irc *Connection) ClearCallback(eventcode string) bool {
 	eventcode = strings.ToUpper(eventcode)
 
-	if _, ok := irc.events[eventcode]; ok {
-		irc.events[eventcode] = make(map[string]func(*Event))
+	irc.eventsMutex.Lock()
+	_, ok := irc.events[eventcode]
+	if ok {
+		irc.events[eventcode] = make(map[int]func(*Event))
+		irc.eventsMutex.Unlock()
 		return true
 	}
+	irc.eventsMutex.Unlock()
 
 	irc.Log.Println("Event not found")
 	return false
 }
 
 // Replace callback i (ID) associated with a given event code with a new callback function.
-func (irc *Connection) ReplaceCallback(eventcode string, i string, callback func(*Event)) {
+func (irc *Connection) ReplaceCallback(eventcode string, i int, callback func(*Event)) {
 	eventcode = strings.ToUpper(eventcode)
 
-	if event, ok := irc.events[eventcode]; ok {
+	irc.eventsMutex.Lock()
+	event, ok := irc.events[eventcode]
+	irc.eventsMutex.Unlock()
+	if ok {
 		if _, ok := event[i]; ok {
 			event[i] = callback
 			return
 		}
-		irc.Log.Printf("Event found, but no callback found at id %s\n", i)
+		irc.Log.Printf("Event found, but no callback found at id %d\n", i)
 	}
 	irc.Log.Printf("Event not found. Use AddCallBack\n")
 }
@@ -77,11 +92,14 @@ func (irc *Connection) ReplaceCallback(eventcode string, i string, callback func
 // Execute all callbacks associated with a given event.
 func (irc *Connection) RunCallbacks(event *Event) {
 	msg := event.Message()
-	if event.Code == "PRIVMSG" && len(msg) > 0 && msg[0] == '\x01' {
+	if event.Code == "PRIVMSG" && len(msg) > 2 && msg[0] == '\x01' {
 		event.Code = "CTCP" //Unknown CTCP
 
-		if i := strings.LastIndex(msg, "\x01"); i > -1 {
+		if i := strings.LastIndex(msg, "\x01"); i > 0 {
 			msg = msg[1:i]
+		} else {
+			irc.Log.Printf("Invalid CTCP Message: %s\n", strconv.Quote(msg))
+			return
 		}
 
 		if msg == "VERSION" {
@@ -101,41 +119,86 @@ func (irc *Connection) RunCallbacks(event *Event) {
 
 		} else if strings.HasPrefix(msg, "ACTION") {
 			event.Code = "CTCP_ACTION"
-			msg = msg[7:]
+			if len(msg) > 6 {
+				msg = msg[7:]
+			} else {
+				msg = ""
+			}
 		}
 
 		event.Arguments[len(event.Arguments)-1] = msg
 	}
 
-	if callbacks, ok := irc.events[event.Code]; ok {
-		if irc.VerboseCallbackHandler {
-			irc.Log.Printf("%v (%v) >> %#v\n", event.Code, len(callbacks), event)
+	irc.eventsMutex.Lock()
+	callbacks := make(map[int]func(*Event))
+	eventCallbacks, ok := irc.events[event.Code]
+	id := 0
+	if ok {
+		for _, callback := range eventCallbacks {
+			callbacks[id] = callback
+			id++
 		}
+	}
+	allCallbacks, ok := irc.events["*"]
+	if ok {
+		for _, callback := range allCallbacks {
+			callbacks[id] = callback
+			id++
+		}
+	}
+	irc.eventsMutex.Unlock()
 
-		for _, callback := range callbacks {
-			go callback(event)
-		}
-	} else if irc.VerboseCallbackHandler {
-		irc.Log.Printf("%v (0) >> %#v\n", event.Code, event)
+	if irc.VerboseCallbackHandler {
+		irc.Log.Printf("%v (%v) >> %#v\n", event.Code, len(callbacks), event)
 	}
 
-	if callbacks, ok := irc.events["*"]; ok {
-		if irc.VerboseCallbackHandler {
-			irc.Log.Printf("Wildcard %v (%v) >> %#v\n", event.Code, len(callbacks), event)
-		}
+	event.Ctx = context.Background()
+	if irc.CallbackTimeout != 0 {
+		event.Ctx, _ = context.WithTimeout(event.Ctx, irc.CallbackTimeout)
+	}
 
-		for _, callback := range callbacks {
-			go callback(event)
+	done := make(chan int)
+	for id, callback := range callbacks {
+		go func(id int, done chan<- int, cb func(*Event), event *Event) {
+			start := time.Now()
+			cb(event)
+			select {
+			case done <- id:
+			case <-event.Ctx.Done(): // If we timed out, report how long until we eventually finished
+				irc.Log.Printf("Canceled callback %s finished in %s >> %#v\n",
+					getFunctionName(cb),
+					time.Since(start),
+					event,
+				)
+			}
+		}(id, done, callback, event)
+	}
+
+	for len(callbacks) > 0 {
+		select {
+		case jobID := <-done:
+			delete(callbacks, jobID)
+		case <-event.Ctx.Done(): // context timed out!
+			timedOutCallbacks := []string{}
+			for _, cb := range callbacks { // Everything left here did not finish
+				timedOutCallbacks = append(timedOutCallbacks, getFunctionName(cb))
+			}
+			irc.Log.Printf("Timeout while waiting for %d callback(s) to finish (%s)\n",
+				len(callbacks),
+				strings.Join(timedOutCallbacks, ", "),
+			)
+			return
 		}
 	}
 }
 
+func getFunctionName(f func(*Event)) string {
+	return runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
+}
+
 // Set up some initial callbacks to handle the IRC/CTCP protocol.
 func (irc *Connection) setupCallbacks() {
-	irc.events = make(map[string]map[string]func(*Event))
-
-	//Handle error events
-	irc.AddCallback("ERROR", func(e *Event) { irc.Disconnect() })
+	irc.events = make(map[string]map[int]func(*Event))
 
 	//Handle ping events
 	irc.AddCallback("PING", func(e *Event) { irc.SendRaw("PONG :" + e.Message()) })
@@ -161,14 +224,14 @@ func (irc *Connection) setupCallbacks() {
 	irc.AddCallback("CTCP_PING", func(e *Event) { irc.SendRawf("NOTICE %s :\x01%s\x01", e.Nick, e.Message()) })
 
 	// 437: ERR_UNAVAILRESOURCE "<nick/channel> :Nick/channel is temporarily unavailable"
-        // Add a _ to current nick. If irc.nickcurrent is empty this cannot
-        // work. It has to be set somewhere first in case the nick is already
-        // taken or unavailable from the beginning.
-        irc.AddCallback("437", func(e *Event) {
-                // If irc.nickcurrent hasn't been set yet, set to irc.nick
-                if irc.nickcurrent == "" {
-                        irc.nickcurrent = irc.nick
-                }
+	// Add a _ to current nick. If irc.nickcurrent is empty this cannot
+	// work. It has to be set somewhere first in case the nick is already
+	// taken or unavailable from the beginning.
+	irc.AddCallback("437", func(e *Event) {
+		// If irc.nickcurrent hasn't been set yet, set to irc.nick
+		if irc.nickcurrent == "" {
+			irc.nickcurrent = irc.nick
+		}
 
 		if len(irc.nickcurrent) > 8 {
 			irc.nickcurrent = "_" + irc.nickcurrent
@@ -181,10 +244,10 @@ func (irc *Connection) setupCallbacks() {
 	// 433: ERR_NICKNAMEINUSE "<nick> :Nickname is already in use"
 	// Add a _ to current nick.
 	irc.AddCallback("433", func(e *Event) {
-                // If irc.nickcurrent hasn't been set yet, set to irc.nick
-                if irc.nickcurrent == "" {
-                        irc.nickcurrent = irc.nick
-                }
+		// If irc.nickcurrent hasn't been set yet, set to irc.nick
+		if irc.nickcurrent == "" {
+			irc.nickcurrent = irc.nick
+		}
 
 		if len(irc.nickcurrent) > 8 {
 			irc.nickcurrent = "_" + irc.nickcurrent
@@ -198,7 +261,7 @@ func (irc *Connection) setupCallbacks() {
 		ns, _ := strconv.ParseInt(e.Message(), 10, 64)
 		delta := time.Duration(time.Now().UnixNano() - ns)
 		if irc.Debug {
-			irc.Log.Printf("Lag: %vs\n", delta)
+			irc.Log.Printf("Lag: %.3f s\n", delta.Seconds())
 		}
 	})
 
@@ -213,6 +276,8 @@ func (irc *Connection) setupCallbacks() {
 	// 1: RPL_WELCOME "Welcome to the Internet Relay Network <nick>!<user>@<host>"
 	// Set irc.nickcurrent to the actually used nick in this connection.
 	irc.AddCallback("001", func(e *Event) {
+		irc.Lock()
 		irc.nickcurrent = e.Arguments[0]
+		irc.Unlock()
 	})
 }

@@ -20,6 +20,7 @@ package irc
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -66,45 +67,90 @@ func (irc *Connection) readLoop() {
 
 			if err != nil {
 				errChan <- err
-				break
+				return
 			}
 
 			if irc.Debug {
 				irc.Log.Printf("<-- %s\n", strings.TrimSpace(msg))
 			}
 
+			irc.lastMessageMutex.Lock()
 			irc.lastMessage = time.Now()
-			msg = msg[:len(msg)-2] //Remove \r\n
-			event := &Event{Raw: msg, Connection: irc}
-			if msg[0] == ':' {
-				if i := strings.Index(msg, " "); i > -1 {
-					event.Source = msg[1:i]
-					msg = msg[i+1 : len(msg)]
-
-				} else {
-					irc.Log.Printf("Misformed msg from server: %#s\n", msg)
-				}
-
-				if i, j := strings.Index(event.Source, "!"), strings.Index(event.Source, "@"); i > -1 && j > -1 {
-					event.Nick = event.Source[0:i]
-					event.User = event.Source[i+1 : j]
-					event.Host = event.Source[j+1 : len(event.Source)]
-				}
+			irc.lastMessageMutex.Unlock()
+			event, err := parseToEvent(msg)
+			event.Connection = irc
+			if err == nil {
+				/* XXX: len(args) == 0: args should be empty */
+				irc.RunCallbacks(event)
 			}
-
-			split := strings.SplitN(msg, " :", 2)
-			args := strings.Split(split[0], " ")
-			event.Code = strings.ToUpper(args[0])
-			event.Arguments = args[1:]
-			if len(split) > 1 {
-				event.Arguments = append(event.Arguments, split[1])
-			}
-
-			/* XXX: len(args) == 0: args should be empty */
-			irc.RunCallbacks(event)
 		}
 	}
-	return
+}
+
+// Unescape tag values as defined in the IRCv3.2 message tags spec
+// http://ircv3.net/specs/core/message-tags-3.2.html
+func unescapeTagValue(value string) string {
+	value = strings.Replace(value, "\\:", ";", -1)
+	value = strings.Replace(value, "\\s", " ", -1)
+	value = strings.Replace(value, "\\\\", "\\", -1)
+	value = strings.Replace(value, "\\r", "\r", -1)
+	value = strings.Replace(value, "\\n", "\n", -1)
+	return value
+}
+
+//Parse raw irc messages
+func parseToEvent(msg string) (*Event, error) {
+	msg = strings.TrimSuffix(msg, "\n") //Remove \r\n
+	msg = strings.TrimSuffix(msg, "\r")
+	event := &Event{Raw: msg}
+	if len(msg) < 5 {
+		return nil, errors.New("Malformed msg from server")
+	}
+
+	if msg[0] == '@' {
+		// IRCv3 Message Tags
+		if i := strings.Index(msg, " "); i > -1 {
+			event.Tags = make(map[string]string)
+			tags := strings.Split(msg[1:i], ";")
+			for _, data := range tags {
+				parts := strings.SplitN(data, "=", 2)
+				if len(parts) == 1 {
+					event.Tags[parts[0]] = ""
+				} else {
+					event.Tags[parts[0]] = unescapeTagValue(parts[1])
+				}
+			}
+			msg = msg[i+1 : len(msg)]
+		} else {
+			return nil, errors.New("Malformed msg from server")
+		}
+	}
+
+	if msg[0] == ':' {
+		if i := strings.Index(msg, " "); i > -1 {
+			event.Source = msg[1:i]
+			msg = msg[i+1 : len(msg)]
+
+		} else {
+			return nil, errors.New("Malformed msg from server")
+		}
+
+		if i, j := strings.Index(event.Source, "!"), strings.Index(event.Source, "@"); i > -1 && j > -1 && i < j {
+			event.Nick = event.Source[0:i]
+			event.User = event.Source[i+1 : j]
+			event.Host = event.Source[j+1 : len(event.Source)]
+		}
+	}
+
+	split := strings.SplitN(msg, " :", 2)
+	args := strings.Split(split[0], " ")
+	event.Code = strings.ToUpper(args[0])
+	event.Arguments = args[1:]
+	if len(split) > 1 {
+		event.Arguments = append(event.Arguments, split[1])
+	}
+	return event, nil
+
 }
 
 // Loop to write to a connection. To be used as a goroutine.
@@ -115,8 +161,7 @@ func (irc *Connection) writeLoop() {
 		select {
 		case <-irc.end:
 			return
-		default:
-			b, ok := <-irc.pwrite
+		case b, ok := <-irc.pwrite:
 			if !ok || b == "" || irc.socket == nil {
 				return
 			}
@@ -140,7 +185,6 @@ func (irc *Connection) writeLoop() {
 			}
 		}
 	}
-	return
 }
 
 // Pings the server if we have not received any messages for 5 minutes
@@ -153,17 +197,21 @@ func (irc *Connection) pingLoop() {
 		select {
 		case <-ticker.C:
 			//Ping if we haven't received anything from the server within the keep alive period
+			irc.lastMessageMutex.Lock()
 			if time.Since(irc.lastMessage) >= irc.KeepAlive {
 				irc.SendRawf("PING %d", time.Now().UnixNano())
 			}
+			irc.lastMessageMutex.Unlock()
 		case <-ticker2.C:
 			//Ping at the ping frequency
 			irc.SendRawf("PING %d", time.Now().UnixNano())
 			//Try to recapture nickname if it's not as configured.
+			irc.Lock()
 			if irc.nick != irc.nickcurrent {
 				irc.nickcurrent = irc.nick
 				irc.SendRawf("NICK %s", irc.nick)
 			}
+			irc.Unlock()
 		case <-irc.end:
 			ticker.Stop()
 			ticker2.Stop()
@@ -172,20 +220,28 @@ func (irc *Connection) pingLoop() {
 	}
 }
 
+func (irc *Connection) isQuitting() bool {
+	irc.Lock()
+	defer irc.Unlock()
+	return irc.quit
+}
+
 // Main loop to control the connection.
 func (irc *Connection) Loop() {
 	errChan := irc.ErrorChan()
-	for !irc.stopped {
+	for !irc.isQuitting() {
 		err := <-errChan
-		if irc.stopped {
-			break
+		if irc.end != nil {
+			close(irc.end)
 		}
-		irc.Log.Printf("Error, disconnected: %s\n", err)
-		for !irc.stopped {
+		irc.Wait()
+		for !irc.isQuitting() {
+			irc.Log.Printf("Error, disconnected: %s\n", err)
 			if err = irc.Reconnect(); err != nil {
 				irc.Log.Printf("Error while reconnecting: %s\n", err)
-				time.Sleep(1 * time.Second)
+				time.Sleep(60 * time.Second)
 			} else {
+				errChan = irc.ErrorChan()
 				break
 			}
 		}
@@ -195,8 +251,17 @@ func (irc *Connection) Loop() {
 // Quit the current connection and disconnect from the server
 // RFC 1459 details: https://tools.ietf.org/html/rfc1459#section-4.1.6
 func (irc *Connection) Quit() {
-	irc.SendRaw("QUIT")
+	quit := "QUIT"
+
+	if irc.QuitMessage != "" {
+		quit = fmt.Sprintf("QUIT :%s", irc.QuitMessage)
+	}
+
+	irc.SendRaw(quit)
+	irc.Lock()
 	irc.stopped = true
+	irc.quit = true
+	irc.Unlock()
 }
 
 // Use the connection to join a given channel.
@@ -243,6 +308,29 @@ func (irc *Connection) Privmsg(target, message string) {
 // Send formated string to specified target (channel or nickname).
 func (irc *Connection) Privmsgf(target, format string, a ...interface{}) {
 	irc.Privmsg(target, fmt.Sprintf(format, a...))
+}
+
+// Kick <user> from <channel> with <msg>. For no message, pass empty string ("")
+func (irc *Connection) Kick(user, channel, msg string) {
+	var cmd bytes.Buffer
+	cmd.WriteString(fmt.Sprintf("KICK %s %s", channel, user))
+	if msg != "" {
+		cmd.WriteString(fmt.Sprintf(" :%s", msg))
+	}
+	cmd.WriteString("\r\n")
+	irc.pwrite <- cmd.String()
+}
+
+// Kick all <users> from <channel> with <msg>. For no message, pass
+// empty string ("")
+func (irc *Connection) MultiKick(users []string, channel string, msg string) {
+	var cmd bytes.Buffer
+	cmd.WriteString(fmt.Sprintf("KICK %s %s", channel, strings.Join(users, ",")))
+	if msg != "" {
+		cmd.WriteString(fmt.Sprintf(" :%s", msg))
+	}
+	cmd.WriteString("\r\n")
+	irc.pwrite <- cmd.String()
 }
 
 // Send raw string.
@@ -302,16 +390,24 @@ func (irc *Connection) Connected() bool {
 // A disconnect sends all buffered messages (if possible),
 // stops all goroutines and then closes the socket.
 func (irc *Connection) Disconnect() {
-	for event := range irc.events {
-		irc.ClearCallback(event)
+	irc.Lock()
+	defer irc.Unlock()
+
+	if irc.end != nil {
+		close(irc.end)
 	}
 
-	close(irc.end)
-	close(irc.pwrite)
-
 	irc.Wait()
-	irc.socket.Close()
-	irc.socket = nil
+
+	irc.end = nil
+
+	if irc.pwrite != nil {
+		close(irc.pwrite)
+	}
+
+	if irc.socket != nil {
+		irc.socket.Close()
+	}
 	irc.ErrorChan() <- ErrDisconnected
 }
 
@@ -327,7 +423,8 @@ func (irc *Connection) Reconnect() error {
 // RFC 1459 details: https://tools.ietf.org/html/rfc1459#section-4.1
 func (irc *Connection) Connect(server string) error {
 	irc.Server = server
-	irc.stopped = false
+	// mark Server as stopped since there can be an error during connect
+	irc.stopped = true
 
 	// make sure everything is ready for connection
 	if len(irc.Server) == 0 {
@@ -370,19 +467,115 @@ func (irc *Connection) Connect(server string) error {
 	if err != nil {
 		return err
 	}
+
+	irc.stopped = false
 	irc.Log.Printf("Connected to %s (%s)\n", irc.Server, irc.socket.RemoteAddr())
 
 	irc.pwrite = make(chan string, 10)
-	irc.Error = make(chan error, 2)
+	irc.Error = make(chan error, 10)
 	irc.Add(3)
 	go irc.readLoop()
 	go irc.writeLoop()
 	go irc.pingLoop()
+
+	if len(irc.WebIRC) > 0 {
+		irc.pwrite <- fmt.Sprintf("WEBIRC %s\r\n", irc.WebIRC)
+	}
+
 	if len(irc.Password) > 0 {
 		irc.pwrite <- fmt.Sprintf("PASS %s\r\n", irc.Password)
 	}
+
+	err = irc.negotiateCaps()
+	if err != nil {
+		return err
+	}
+
+	realname := irc.user
+	if irc.RealName != "" {
+		realname = irc.RealName
+	}
+
 	irc.pwrite <- fmt.Sprintf("NICK %s\r\n", irc.nick)
-	irc.pwrite <- fmt.Sprintf("USER %s 0.0.0.0 0.0.0.0 :%s\r\n", irc.user, irc.user)
+	irc.pwrite <- fmt.Sprintf("USER %s 0.0.0.0 0.0.0.0 :%s\r\n", irc.user, realname)
+	return nil
+}
+
+// Negotiate IRCv3 capabilities
+func (irc *Connection) negotiateCaps() error {
+	saslResChan := make(chan *SASLResult)
+	if irc.UseSASL {
+		irc.RequestCaps = append(irc.RequestCaps, "sasl")
+		irc.setupSASLCallbacks(saslResChan)
+	}
+
+	if len(irc.RequestCaps) == 0 {
+		return nil
+	}
+
+	cap_chan := make(chan bool, len(irc.RequestCaps))
+	irc.AddCallback("CAP", func(e *Event) {
+		if len(e.Arguments) != 3 {
+			return
+		}
+		command := e.Arguments[1]
+
+		if command == "LS" {
+			missing_caps := len(irc.RequestCaps)
+			for _, cap_name := range strings.Split(e.Arguments[2], " ") {
+				for _, req_cap := range irc.RequestCaps {
+					if cap_name == req_cap {
+						irc.pwrite <- fmt.Sprintf("CAP REQ :%s\r\n", cap_name)
+						missing_caps--
+					}
+				}
+			}
+
+			for i := 0; i < missing_caps; i++ {
+				cap_chan <- true
+			}
+		} else if command == "ACK" || command == "NAK" {
+			for _, cap_name := range strings.Split(strings.TrimSpace(e.Arguments[2]), " ") {
+				if cap_name == "" {
+					continue
+				}
+
+				if command == "ACK" {
+					irc.AcknowledgedCaps = append(irc.AcknowledgedCaps, cap_name)
+				}
+				cap_chan <- true
+			}
+		}
+	})
+
+	irc.pwrite <- "CAP LS\r\n"
+
+	if irc.UseSASL {
+		select {
+		case res := <-saslResChan:
+			if res.Failed {
+				close(saslResChan)
+				return res.Err
+			}
+		case <-time.After(time.Second * 15):
+			close(saslResChan)
+			return errors.New("SASL setup timed out. This shouldn't happen.")
+		}
+	}
+
+	// Wait for all capabilities to be ACKed or NAKed before ending negotiation
+	for i := 0; i < len(irc.RequestCaps); i++ {
+		<-cap_chan
+	}
+	irc.pwrite <- fmt.Sprintf("CAP END\r\n")
+
+	realname := irc.user
+	if irc.RealName != "" {
+		realname = irc.RealName
+	}
+
+	irc.pwrite <- fmt.Sprintf("NICK %s\r\n", irc.nick)
+	irc.pwrite <- fmt.Sprintf("USER %s 0.0.0.0 0.0.0.0 :%s\r\n", irc.user, realname)
 	return nil
 }
 
@@ -399,14 +592,17 @@ func IRC(nick, user string) *Connection {
 	}
 
 	irc := &Connection{
-		nick:      nick,
-		user:      user,
-		Log:       log.New(os.Stdout, "", log.LstdFlags),
-		end:       make(chan struct{}),
-		Version:   VERSION,
-		KeepAlive: 4 * time.Minute,
-		Timeout:   1 * time.Minute,
-		PingFreq:  15 * time.Minute,
+		nick:        nick,
+		nickcurrent: nick,
+		user:        user,
+		Log:         log.New(os.Stdout, "", log.LstdFlags),
+		end:         make(chan struct{}),
+		Version:     VERSION,
+		KeepAlive:   4 * time.Minute,
+		Timeout:     1 * time.Minute,
+		PingFreq:    15 * time.Minute,
+		SASLMech:    "PLAIN",
+		QuitMessage: "",
 	}
 	irc.setupCallbacks()
 	return irc

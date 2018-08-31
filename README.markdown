@@ -18,7 +18,7 @@ Install
 
 Example
 -------
-See test/irc_test.go
+See [examples/simple/simple.go](examples/simple/simple.go) and [irc_test.go](irc_test.go)
 
 Events for callbacks
 --------------------
@@ -41,10 +41,24 @@ Events for callbacks
 AddCallback Example
 -------------------
 	ircobj.AddCallback("PRIVMSG", func(event *irc.Event) {
-		//e.Message() contains the message
-		//e.Nick Contains the sender
-		//e.Arguments[0] Contains the channel
+		//event.Message() contains the message
+		//event.Nick Contains the sender
+		//event.Arguments[0] Contains the channel
 	});
+
+Please note: Callbacks are run in the main thread. If a callback needs a long
+time to execute please run it in a new thread.
+
+Example:
+
+        ircobj.AddCallback("PRIVMSG", func(event *irc.Event) {
+		go func(event *irc.Event) {
+                        //event.Message() contains the message
+                        //event.Nick Contains the sender
+                        //event.Arguments[0] Contains the channel
+		}(event)
+        });
+
 
 Commands
 --------
@@ -59,7 +73,7 @@ Commands
 	ircobj.SendRawf("<formatstring>", ...) //sends formatted string to server.n
 	ircobj.Join("<#channel> [password]") 
 	ircobj.Nick("newnick") 
-	ircobj.Privmsg("<nickname | #channel>", "msg")
+	ircobj.Privmsg("<nickname | #channel>", "msg") // sends a message to either a certain nick or a channel
 	ircobj.Privmsgf(<nickname | #channel>, "<formatstring>", ...)
 	ircobj.Notice("<nickname | #channel>", "msg")
 	ircobj.Noticef("<nickname | #channel>", "<formatstring>", ...)

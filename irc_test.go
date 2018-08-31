@@ -1,91 +1,21 @@
 package irc
 
 import (
-	//	"github.com/thoj/go-ircevent"
 	"crypto/tls"
+	"math/rand"
+	"sort"
 	"testing"
 	"time"
 )
 
-func TestConnection(t *testing.T) {
-	irccon1 := IRC("go-eventirc1", "go-eventirc1")
-	irccon1.VerboseCallbackHandler = true
-	irccon1.Debug = true
-	irccon2 := IRC("go-eventirc2", "go-eventirc2")
-	irccon2.VerboseCallbackHandler = true
-	irccon2.Debug = true
-	err := irccon1.Connect("irc.freenode.net:6667")
-	if err != nil {
-		t.Log(err.Error())
-		t.Fatal("Can't connect to freenode.")
-	}
-	err = irccon2.Connect("irc.freenode.net:6667")
-	if err != nil {
-		t.Log(err.Error())
-		t.Fatal("Can't connect to freenode.")
-	}
-	irccon1.AddCallback("001", func(e *Event) { irccon1.Join("#go-eventirc") })
-	irccon2.AddCallback("001", func(e *Event) { irccon2.Join("#go-eventirc") })
-	con2ok := false
-	irccon1.AddCallback("366", func(e *Event) {
-		t := time.NewTicker(1 * time.Second)
-		i := 10
-		for {
-			<-t.C
-			irccon1.Privmsgf("#go-eventirc", "Test Message%d\n", i)
-			if con2ok {
-				i -= 1
-			}
-			if i == 0 {
-				t.Stop()
-				irccon1.Quit()
-			}
-		}
-	})
+const server = "irc.freenode.net:6667"
+const serverssl = "irc.freenode.net:7000"
+const channel = "#go-eventirc-test"
+const dict = "abcdefghijklmnopqrstuvwxyz"
 
-	irccon2.AddCallback("366", func(e *Event) {
-		irccon2.Privmsg("#go-eventirc", "Test Message\n")
-		con2ok = true
-		irccon2.Nick("go-eventnewnick")
-	})
-
-	irccon2.AddCallback("PRIVMSG", func(e *Event) {
-		t.Log(e.Message())
-		if e.Message() == "Test Message5" {
-			irccon2.Quit()
-		}
-	})
-
-	irccon2.AddCallback("NICK", func(e *Event) {
-		if irccon2.nickcurrent == "go-eventnewnick" {
-			t.Fatal("Nick change did not work!")
-		}
-	})
-	go irccon2.Loop()
-	irccon1.Loop()
-}
-
-func TestConnectionSSL(t *testing.T) {
-	irccon := IRC("go-eventirc", "go-eventirc")
-	irccon.VerboseCallbackHandler = true
-	irccon.Debug = true
-	irccon.UseTLS = true
-	irccon.TLSConfig = &tls.Config{InsecureSkipVerify: true}
-	err := irccon.Connect("irc.freenode.net:7000")
-	if err != nil {
-		t.Log(err.Error())
-		t.Fatal("Can't connect to freenode.")
-	}
-	irccon.AddCallback("001", func(e *Event) { irccon.Join("#go-eventirc") })
-
-	irccon.AddCallback("366", func(e *Event) {
-		irccon.Privmsg("#go-eventirc", "Test Message\n")
-		time.Sleep(2 * time.Second)
-		irccon.Quit()
-	})
-
-	irccon.Loop()
-}
+//Spammy
+const verbose_tests = false
+const debug_tests = true
 
 func TestConnectionEmtpyServer(t *testing.T) {
 	irccon := IRC("go-eventirc", "go-eventirc")
@@ -166,8 +96,7 @@ func TestConnectionEmptyNick(t *testing.T) {
 
 func TestRemoveCallback(t *testing.T) {
 	irccon := IRC("go-eventirc", "go-eventirc")
-	irccon.VerboseCallbackHandler = true
-	irccon.Debug = true
+	debugTest(irccon)
 
 	done := make(chan int, 10)
 
@@ -187,15 +116,14 @@ func TestRemoveCallback(t *testing.T) {
 	results = append(results, <-done)
 	results = append(results, <-done)
 
-	if len(results) != 2 || !(results[0] == 1 && results[1] == 3) {
+	if !compareResults(results, 1, 3) {
 		t.Error("Callback 2 not removed")
 	}
 }
 
 func TestWildcardCallback(t *testing.T) {
 	irccon := IRC("go-eventirc", "go-eventirc")
-	irccon.VerboseCallbackHandler = true
-	irccon.Debug = true
+	debugTest(irccon)
 
 	done := make(chan int, 10)
 
@@ -211,15 +139,14 @@ func TestWildcardCallback(t *testing.T) {
 	results = append(results, <-done)
 	results = append(results, <-done)
 
-	if len(results) != 2 || !(results[0] == 1 && results[1] == 2) {
+	if !compareResults(results, 1, 2) {
 		t.Error("Wildcard callback not called")
 	}
 }
 
 func TestClearCallback(t *testing.T) {
 	irccon := IRC("go-eventirc", "go-eventirc")
-	irccon.VerboseCallbackHandler = true
-	irccon.Debug = true
+	debugTest(irccon)
 
 	done := make(chan int, 10)
 
@@ -238,7 +165,7 @@ func TestClearCallback(t *testing.T) {
 	results = append(results, <-done)
 	results = append(results, <-done)
 
-	if len(results) != 2 || !(results[0] == 2 && results[1] == 3) {
+	if !compareResults(results, 2, 3) {
 		t.Error("Callbacks not cleared")
 	}
 }
@@ -257,4 +184,177 @@ func TestIRCemptyUser(t *testing.T) {
 	if irccon != nil {
 		t.Error("empty user didn't result in error")
 	}
+}
+func TestConnection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+	rand.Seed(time.Now().UnixNano())
+	ircnick1 := randStr(8)
+	ircnick2 := randStr(8)
+	irccon1 := IRC(ircnick1, "IRCTest1")
+
+	irccon1.PingFreq = time.Second * 3
+
+	debugTest(irccon1)
+
+	irccon2 := IRC(ircnick2, "IRCTest2")
+	debugTest(irccon2)
+
+	teststr := randStr(20)
+	testmsgok := make(chan bool, 1)
+
+	irccon1.AddCallback("001", func(e *Event) { irccon1.Join(channel) })
+	irccon2.AddCallback("001", func(e *Event) { irccon2.Join(channel) })
+	irccon1.AddCallback("366", func(e *Event) {
+		go func(e *Event) {
+			tick := time.NewTicker(1 * time.Second)
+			i := 10
+			for {
+				select {
+				case <-tick.C:
+					irccon1.Privmsgf(channel, "%s\n", teststr)
+					if i == 0 {
+						t.Errorf("Timeout while wating for test message from the other thread.")
+						return
+					}
+
+				case <-testmsgok:
+					tick.Stop()
+					irccon1.Quit()
+					return
+				}
+				i -= 1
+			}
+		}(e)
+	})
+
+	irccon2.AddCallback("366", func(e *Event) {
+		ircnick2 = randStr(8)
+		irccon2.Nick(ircnick2)
+	})
+
+	irccon2.AddCallback("PRIVMSG", func(e *Event) {
+		if e.Message() == teststr {
+			if e.Nick == ircnick1 {
+				testmsgok <- true
+				irccon2.Quit()
+			} else {
+				t.Errorf("Test message came from an unexpected nickname")
+			}
+		} else {
+			//this may fail if there are other incoming messages, unlikely.
+			t.Errorf("Test message mismatch")
+		}
+	})
+
+	irccon2.AddCallback("NICK", func(e *Event) {
+		if irccon2.nickcurrent == ircnick2 {
+			t.Errorf("Nick change did not work!")
+		}
+	})
+
+	err := irccon1.Connect(server)
+	if err != nil {
+		t.Log(err.Error())
+		t.Errorf("Can't connect to freenode.")
+	}
+	err = irccon2.Connect(server)
+	if err != nil {
+		t.Log(err.Error())
+		t.Errorf("Can't connect to freenode.")
+	}
+
+	go irccon2.Loop()
+	irccon1.Loop()
+}
+
+func TestReconnect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+	ircnick1 := randStr(8)
+	irccon := IRC(ircnick1, "IRCTestRe")
+	irccon.PingFreq = time.Second * 3
+	debugTest(irccon)
+
+	connects := 0
+	irccon.AddCallback("001", func(e *Event) { irccon.Join(channel) })
+
+	irccon.AddCallback("366", func(e *Event) {
+		connects += 1
+		if connects > 2 {
+			irccon.Privmsgf(channel, "Connection nr %d (test done)\n", connects)
+			go irccon.Quit()
+		} else {
+			irccon.Privmsgf(channel, "Connection nr %d\n", connects)
+			time.Sleep(100) //Need to let the thraed actually send before closing socket
+			go irccon.Disconnect()
+		}
+	})
+
+	err := irccon.Connect(server)
+	if err != nil {
+		t.Log(err.Error())
+		t.Errorf("Can't connect to freenode.")
+	}
+
+	irccon.Loop()
+	if connects != 3 {
+		t.Errorf("Reconnect test failed. Connects = %d", connects)
+	}
+}
+
+func TestConnectionSSL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+	ircnick1 := randStr(8)
+	irccon := IRC(ircnick1, "IRCTestSSL")
+	debugTest(irccon)
+	irccon.UseTLS = true
+	irccon.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	irccon.AddCallback("001", func(e *Event) { irccon.Join(channel) })
+
+	irccon.AddCallback("366", func(e *Event) {
+		irccon.Privmsg(channel, "Test Message from SSL\n")
+		irccon.Quit()
+	})
+
+	err := irccon.Connect(serverssl)
+	if err != nil {
+		t.Log(err.Error())
+		t.Errorf("Can't connect to freenode.")
+	}
+
+	irccon.Loop()
+}
+
+// Helper Functions
+func randStr(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = dict[rand.Intn(len(dict))]
+	}
+	return string(b)
+}
+
+func debugTest(irccon *Connection) *Connection {
+	irccon.VerboseCallbackHandler = verbose_tests
+	irccon.Debug = debug_tests
+	return irccon
+}
+
+func compareResults(received []int, desired ...int) bool {
+	if len(desired) != len(received) {
+		return false
+	}
+	sort.IntSlice(desired).Sort()
+	sort.IntSlice(received).Sort()
+	for i := 0; i < len(desired); i++ {
+		if desired[i] != received[i] {
+			return false
+		}
+	}
+	return true
 }
