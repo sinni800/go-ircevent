@@ -13,7 +13,7 @@ func (e *IRCEvent) IsChannelMessage() bool {
 
 func (e *IRCEvent) GetMessageSource() string {
 	if len(e.Arguments) == 0 {
-		return e.Message
+		return e.Message()
 	}
 	if strings.HasPrefix(e.Arguments[0], "#") {
 		return e.Arguments[0]
